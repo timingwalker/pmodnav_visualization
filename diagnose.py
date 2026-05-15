@@ -5,9 +5,9 @@ import numpy as np
 import imufusion
 
 SERIAL_PORT = "COM4"
-BAUD_RATE = 115200
+BAUD_RATE = 460800
 GYRO_SCALE = 245.0 / 32768.0 * np.pi / 180.0
-ACC_SCALE = 2.0 / 32768.0
+ACC_SCALE = 4.0 / 32768.0
 MAG_SCALE = 4.0 / 32768.0
 
 CALIB_FILE = "calib.json"
@@ -22,7 +22,7 @@ if os.path.exists(CALIB_FILE):
 else:
     print("Warning: no calibration file")
 
-settings = imufusion.Settings(imufusion.CONVENTION_NWU, 0.005, 245.0, 1.0, 2.0, 3)
+settings = imufusion.Settings(imufusion.CONVENTION_NWU, 0.5, 245.0, 1.0, 2.0, 3)
 ahrs = imufusion.Ahrs(settings)
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.5)
 
@@ -38,7 +38,7 @@ while ahrs.flags.initialising and n < 500:
     gx=v[0]*GYRO_SCALE-gyro_bias[0]; gy=v[1]*GYRO_SCALE-gyro_bias[1]; gz=v[2]*GYRO_SCALE-gyro_bias[2]
     ax=v[3]*ACC_SCALE; ay=v[4]*ACC_SCALE; az=v[5]*ACC_SCALE
     mx=(v[6]-mag_offset[0])*MAG_SCALE; my=(v[7]-mag_offset[1])*MAG_SCALE; mz=(v[8]-mag_offset[2])*MAG_SCALE
-    ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,my,mz],dtype=np.float64), 1/85)
+    ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,my,mz],dtype=np.float64), 1/449)
     n += 1
 print(f"Init done: {n} frames\n")
 
@@ -131,7 +131,7 @@ try:
         gx=v[0]*GYRO_SCALE-gyro_bias[0]; gy=v[1]*GYRO_SCALE-gyro_bias[1]; gz=v[2]*GYRO_SCALE-gyro_bias[2]
         ax=v[3]*ACC_SCALE; ay=v[4]*ACC_SCALE; az=v[5]*ACC_SCALE
         mx=(v[6]-mag_offset[0])*MAG_SCALE; my=(v[7]-mag_offset[1])*MAG_SCALE; mz=(v[8]-mag_offset[2])*MAG_SCALE
-        ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,my,mz],dtype=np.float64), 1/85)
+        ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,my,mz],dtype=np.float64), 1/449)
         if cnt % 10 == 0:
             r, p, y = ahrs.quaternion.to_euler()
             print(f"  {r:8.1f} {p:8.1f} {y:8.1f}")

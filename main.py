@@ -3,6 +3,7 @@ import os
 import json
 import time
 import ctypes
+import gc
 import threading
 import numpy as np
 import pyvista as pv
@@ -11,36 +12,81 @@ import imufusion
 
 # Raise Windows timer resolution to 1ms
 ctypes.windll.winmm.timeBeginPeriod(1)
+# Disable automatic GC to prevent stop-the-world pauses
+gc.disable()
 
 # ============================================================
 # Configuration
 # ============================================================
 SERIAL_PORT = "COM4"
-BAUD_RATE = 115200
-SAMPLE_PERIOD = 1 / 85
+BAUD_RATE = 460800
+SAMPLE_PERIOD = 1 / 449
 
 GYRO_SCALE = 245.0 / 32768.0 * np.pi / 180.0
-ACC_SCALE = 2.0 / 32768.0
+ACC_SCALE = 4.0 / 32768.0
 MAG_SCALE = 4.0 / 32768.0
 
-GAIN = 0.1             # Lower = trust gyro more (responsive); higher = trust accel/mag more
+GAIN = 0.8             # Lower = trust gyro more (responsive); higher = trust accel/mag more
 GYRO_RANGE = 245.0
-ACC_REJECTION = 1.0
-MAG_REJECTION = 2.0
+ACC_REJECTION = 5.0     # Higher = tolerate more non-gravity acceleration
+MAG_REJECTION = 10.0     # Higher = trust magnetometer more (counter gyro cross-axis)
 RECOVERY_PERIOD = 3
 CALIBRATION_FRAMES = 100
 USE_MAGNETOMETER = True
 
 # ============================================================
+# Arguments
+# ============================================================
+PLAYBACK_FILE = None
+GAIN_OVERRIDE = None
+ACC_REJ_OVERRIDE = None
+MAG_REJ_OVERRIDE = None
+SENSOR_MODE = "gam"  # g=gyro, a=accel, m=mag
+
+def _arg_val(flag):
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return float(sys.argv[idx + 1])
+    return None
+
+def _arg_str(flag, default):
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return default
+
+if "--playback" in sys.argv:
+    idx = sys.argv.index("--playback")
+    if idx + 1 < len(sys.argv):
+        PLAYBACK_FILE = sys.argv[idx + 1]
+
+GAIN_OVERRIDE = _arg_val("--gain")
+ACC_REJ_OVERRIDE = _arg_val("--acc-rej")
+MAG_REJ_OVERRIDE = _arg_val("--mag-rej")
+SENSOR_MODE = _arg_str("--sensors", "gam")
+
+if GAIN_OVERRIDE is not None:
+    GAIN = GAIN_OVERRIDE
+if ACC_REJ_OVERRIDE is not None:
+    ACC_REJECTION = ACC_REJ_OVERRIDE
+if MAG_REJ_OVERRIDE is not None:
+    MAG_REJECTION = MAG_REJ_OVERRIDE
+
+print(f"Sensor mode: {SENSOR_MODE}  GAIN={GAIN}  ACC_REJ={ACC_REJECTION}  MAG_REJ={MAG_REJECTION}")
+
+# ============================================================
 # Serial port
 # ============================================================
-try:
-    import serial
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
-    print(f"Serial {SERIAL_PORT} opened")
-except Exception as e:
-    print(f"Cannot open serial {SERIAL_PORT}: {e}")
-    ser = None
+ser = None
+if PLAYBACK_FILE is None:
+    try:
+        import serial
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+        print(f"Serial {SERIAL_PORT} opened")
+    except Exception as e:
+        print(f"Cannot open serial {SERIAL_PORT}: {e}")
 
 # ============================================================
 # Calibration (load existing or re-acquire)
@@ -48,6 +94,7 @@ except Exception as e:
 CALIB_FILE = os.path.join(os.path.dirname(__file__), "calib.json")
 gyro_bias = np.zeros(3)
 mag_offset = np.zeros(3)
+gz_deadband = 0.0  # rad/s, below this threshold gz is forced to 0
 
 def parse_line(line):
     line = line.strip()
@@ -66,15 +113,18 @@ if ser is not None:
         d = json.load(open(CALIB_FILE))
         gyro_bias = np.array(d["gyro_bias"])
         mag_offset = np.array(d["mag_offset"])
+        gz_deadband = d.get("gz_deadband", 0.0)
         print(f"Calibration loaded ({CALIB_FILE})")
         print(f"  Gyro bias: X={gyro_bias[0]*180/np.pi:.2f} Y={gyro_bias[1]*180/np.pi:.2f} Z={gyro_bias[2]*180/np.pi:.2f} deg/s")
+        print(f"  GZ deadband: {gz_deadband*180/np.pi:.2f} deg/s")
         print(f"  Hard-iron: X={mag_offset[0]:.0f} Y={mag_offset[1]:.0f} Z={mag_offset[2]:.0f}")
     else:
         if "--recal" in sys.argv:
             print("Force recalibrating...")
-        # Gyro bias
+        # Gyro bias + Z deadband
         print(f"Calibrating gyro bias (keep sensor still, {CALIBRATION_FRAMES} frames)...")
         samples = 0
+        gz_samples = []
         while samples < CALIBRATION_FRAMES:
             raw = ser.readline().decode(errors="ignore")
             vals = parse_line(raw)
@@ -84,31 +134,57 @@ if ser is not None:
             gyro_bias[0] += gx * GYRO_SCALE
             gyro_bias[1] += gy * GYRO_SCALE
             gyro_bias[2] += gz * GYRO_SCALE
+            gz_samples.append(gz * GYRO_SCALE)  # in rad/s
             samples += 1
         gyro_bias /= CALIBRATION_FRAMES
+        gz_std = float(np.std(gz_samples))
+        gz_deadband = 5.0 * gz_std  # 5σ threshold
         bias_dps = gyro_bias * 180 / np.pi
         print(f"  Gyro bias: X={bias_dps[0]:.2f} Y={bias_dps[1]:.2f} Z={bias_dps[2]:.2f} deg/s")
+        print(f"  GZ noise std: {gz_std*180/np.pi:.3f} deg/s, deadband: {gz_deadband*180/np.pi:.2f} deg/s")
 
-        # Magnetometer hard-iron calibration
-        print("Magnetometer calibration: rotate sensor slowly (20 sec)...")
+        # Magnetometer hard-iron calibration (guided multi-step)
         mag_min = np.full(3, 1e9)
         mag_max = np.full(3, -1e9)
-        t0 = time.perf_counter()
-        while time.perf_counter() - t0 < 20.0:
-            raw = ser.readline().decode(errors="ignore")
-            vals = parse_line(raw)
-            if vals is None:
-                continue
-            mx, my, mz = vals[6], vals[7], vals[8]
-            mag_min = np.minimum(mag_min, [mx, my, mz])
-            mag_max = np.maximum(mag_max, [mx, my, mz])
+
+        def mag_collect(duration, prompt):
+            print(f"\n  {prompt}")
+            print(f"    ({duration}s, press Ctrl+C to skip this step)")
+            t0 = time.perf_counter()
+            try:
+                while time.perf_counter() - t0 < duration:
+                    raw = ser.readline().decode(errors="ignore")
+                    vals = parse_line(raw)
+                    if vals is None:
+                        continue
+                    mx, my, mz = vals[6], vals[7], vals[8]
+                    mag_min[0] = min(mag_min[0], mx)
+                    mag_min[1] = min(mag_min[1], my)
+                    mag_min[2] = min(mag_min[2], mz)
+                    mag_max[0] = max(mag_max[0], mx)
+                    mag_max[1] = max(mag_max[1], my)
+                    mag_max[2] = max(mag_max[2], mz)
+            except KeyboardInterrupt:
+                pass
+            print(f"    Range X=[{mag_min[0]}, {mag_max[0]}] Y=[{mag_min[1]}, {mag_max[1]}] Z=[{mag_min[2]}, {mag_max[2]}]")
+
+        print("\n  --- Magnetometer Calibration ---")
+        print("  Collect data in 4 poses to cover all axes.")
+        input("  Ready? Press Enter to start...")
+
+        mag_collect(15, "1/4: Sensor FLAT on desk, slowly spin 360° around Z")
+        mag_collect(15, "2/4: Pitch sensor UP ~60°, slowly spin around Z")
+        mag_collect(15, "3/4: Roll sensor LEFT ~60°, slowly spin around Z")
+        mag_collect(15, "4/4: Random motion — tilt and rotate in all directions")
+
         mag_offset = (mag_max + mag_min) / 2.0
-        print(f"  Hard-iron offset: X={mag_offset[0]:.0f} Y={mag_offset[1]:.0f} Z={mag_offset[2]:.0f}")
+        print(f"\n  Hard-iron offset: X={mag_offset[0]:.0f} Y={mag_offset[1]:.0f} Z={mag_offset[2]:.0f}")
 
         # Save to file
         json.dump({
             "gyro_bias": gyro_bias.tolist(),
             "mag_offset": mag_offset.tolist(),
+            "gz_deadband": gz_deadband,
         }, open(CALIB_FILE, "w"))
         print(f"  Calibration saved to {CALIB_FILE}")
 
@@ -124,7 +200,7 @@ ahrs = imufusion.Ahrs(settings)
 # ============================================================
 # AHRS init (wait for initialising flag to clear before opening window)
 # ============================================================
-if ser is not None:
+if ser is not None and SENSOR_MODE != "g":
     print("AHRS initializing (keep sensor still)...")
     init_frames = 0
     max_init = 500 if USE_MAGNETOMETER else 200
@@ -167,18 +243,55 @@ shared_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
 shared_euler = np.zeros(3)
 shared_frame_count = 0
 
+# Quaternion helpers for gyro-only mode
+def _quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ])
+
+def _gyro_integrate(q, gyro, dt):
+    angle = np.linalg.norm(gyro) * dt
+    if angle < 1e-12:
+        return q
+    axis = gyro * dt / angle
+    half = angle / 2.0
+    s = np.sin(half)
+    dq = np.array([np.cos(half), axis[0]*s, axis[1]*s, axis[2]*s])
+    return _quat_mul(q, dq)
+
+def _quat_to_euler(q):
+    w, x, y, z = q
+    sr_cp = 2*(w*x + y*z); cr_cp = 1 - 2*(x*x + y*y)
+    roll = np.arctan2(sr_cp, cr_cp)
+    sp = 2*(w*y - z*x)
+    sp = max(-1.0, min(1.0, sp))
+    pitch = np.arcsin(sp)
+    sy_cp = 2*(w*z + x*y); cy_cp = 1 - 2*(y*y + z*z)
+    yaw = np.arctan2(sy_cp, cy_cp)
+    return np.array([np.degrees(roll), np.degrees(pitch), np.degrees(yaw)])
+
 # ============================================================
 # Serial read thread
 # ============================================================
 def serial_thread():
     global shared_quaternion, shared_euler, shared_frame_count
     buf = b""
+    last_t = time.perf_counter()
+    q_gyro = np.array([1.0, 0.0, 0.0, 0.0])  # for gyro-only mode
 
     while True:
         try:
-            # Read all available bytes
-            chunk = ser.read(max(1, ser.in_waiting or 1))
-            if not chunk:
+            # Non-blocking read: only read available bytes
+            n = ser.in_waiting
+            if n:
+                chunk = ser.read(n)
+            else:
+                time.sleep(0.001)
                 continue
             buf += chunk
 
@@ -194,6 +307,9 @@ def serial_thread():
                 gx = gx * GYRO_SCALE - gyro_bias[0]
                 gy = gy * GYRO_SCALE - gyro_bias[1]
                 gz = gz * GYRO_SCALE - gyro_bias[2]
+                # Apply Z-axis deadband to suppress cross-axis leakage
+                if gz_deadband > 0 and abs(gz) < gz_deadband:
+                    gz = 0.0
                 ax *= ACC_SCALE
                 ay *= ACC_SCALE
                 az *= ACC_SCALE
@@ -202,24 +318,155 @@ def serial_thread():
                 mz = (mz - mag_offset[2]) * MAG_SCALE
 
                 gyro = np.array([gx, -gy, gz], dtype=np.float64)
-                acc = np.array([ax, -ay, az], dtype=np.float64)
-                mag = np.array([mx, my, mz], dtype=np.float64)
+                acc  = np.array([ax, -ay, az], dtype=np.float64)
+                mag  = np.array([mx, my, mz], dtype=np.float64)
 
-                if USE_MAGNETOMETER:
-                    ahrs.update(gyro, acc, mag, SAMPLE_PERIOD)
-                else:
-                    ahrs.update_no_magnetometer(gyro, acc, SAMPLE_PERIOD)
+                now = time.perf_counter()
+                dt = now - last_t
+                last_t = now
+                if dt > 0.1:
+                    dt = SAMPLE_PERIOD
 
-                # to_euler() returns degrees
-                q = ahrs.quaternion.wxyz
-                e = ahrs.quaternion.to_euler()
+                # --- Sensor mode dispatch ---
+                if SENSOR_MODE == "g":
+                    q_gyro = _gyro_integrate(q_gyro, gyro, dt)
+                    q_out = q_gyro.copy()
+                    e_out = _quat_to_euler(q_out)
+                elif SENSOR_MODE == "ga":
+                    ahrs.update_no_magnetometer(gyro, acc, dt)
+                    q_out = ahrs.quaternion.wxyz
+                    e_out = ahrs.quaternion.to_euler()
+                elif SENSOR_MODE == "gm":
+                    ahrs.update(gyro, np.zeros(3), mag, dt)
+                    q_out = ahrs.quaternion.wxyz
+                    e_out = ahrs.quaternion.to_euler()
+                elif SENSOR_MODE == "am":
+                    ahrs.update(np.zeros(3), acc, mag, dt)
+                    q_out = ahrs.quaternion.wxyz
+                    e_out = ahrs.quaternion.to_euler()
+                elif SENSOR_MODE == "a":
+                    ahrs.update_no_magnetometer(np.zeros(3), acc, dt)
+                    q_out = ahrs.quaternion.wxyz
+                    e_out = ahrs.quaternion.to_euler()
+                elif SENSOR_MODE == "m":
+                    ahrs.update(np.zeros(3), np.zeros(3), mag, dt)
+                    q_out = ahrs.quaternion.wxyz
+                    e_out = ahrs.quaternion.to_euler()
+                else:  # "gam" default
+                    if USE_MAGNETOMETER:
+                        ahrs.update(gyro, acc, mag, dt)
+                    else:
+                        ahrs.update_no_magnetometer(gyro, acc, dt)
+                    q_out = ahrs.quaternion.wxyz
+                    e_out = ahrs.quaternion.to_euler()
+
                 with orientation_lock:
-                    shared_quaternion = np.array(q)
-                    shared_euler = np.array(e)
+                    shared_quaternion = np.array(q_out)
+                    shared_euler = np.array(e_out)
                     shared_frame_count += 1
 
         except Exception:
             time.sleep(0.001)
+
+
+def playback_thread():
+    """Read pre-recorded serial data from file and feed through AHRS."""
+    global shared_quaternion, shared_euler, shared_frame_count
+    q_gyro = np.array([1.0, 0.0, 0.0, 0.0])
+    lines_data = []
+    with open(PLAYBACK_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",", 1)
+            if len(parts) != 2:
+                continue
+            t_rel = float(parts[0])
+            raw = parts[1]
+            lines_data.append((t_rel, raw))
+    if not lines_data:
+        return
+    total_duration = lines_data[-1][0]
+    print(f"Playback: {len(lines_data)} frames over {total_duration:.1f}s "
+          f"({len(lines_data)/total_duration:.1f} Hz)")
+
+    last_t = time.perf_counter()
+    while True:
+        t_start = time.perf_counter()
+        idx = 0
+        while idx < len(lines_data):
+            t_target = t_start + lines_data[idx][0]
+            wait = t_target - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            vals = parse_line(lines_data[idx][1])
+            idx += 1
+            if vals is None:
+                continue
+
+            gx, gy, gz, ax, ay, az, mx, my, mz = vals
+            gx = gx * GYRO_SCALE - gyro_bias[0]
+            gy = gy * GYRO_SCALE - gyro_bias[1]
+            gz = gz * GYRO_SCALE - gyro_bias[2]
+            if gz_deadband > 0 and abs(gz) < gz_deadband:
+                gz = 0.0
+            ax *= ACC_SCALE; ay *= ACC_SCALE; az *= ACC_SCALE
+            mx = (mx - mag_offset[0]) * MAG_SCALE
+            my = (my - mag_offset[1]) * MAG_SCALE
+            mz = (mz - mag_offset[2]) * MAG_SCALE
+
+            gyro = np.array([gx, -gy, gz], dtype=np.float64)
+            acc = np.array([ax, -ay, az], dtype=np.float64)
+            mag = np.array([mx, my, mz], dtype=np.float64)
+
+            now = time.perf_counter()
+            dt = now - last_t
+            last_t = now
+            if dt > 0.1:
+                dt = SAMPLE_PERIOD
+            # --- Sensor mode dispatch ---
+            if SENSOR_MODE == "g":
+                q_gyro = _gyro_integrate(q_gyro, gyro, dt)
+                q_out = q_gyro.copy()
+                e_out = _quat_to_euler(q_out)
+            elif SENSOR_MODE == "ga":
+                ahrs.update_no_magnetometer(gyro, acc, dt)
+                q_out = ahrs.quaternion.wxyz
+                e_out = ahrs.quaternion.to_euler()
+            elif SENSOR_MODE == "gm":
+                ahrs.update(gyro, np.zeros(3), mag, dt)
+                q_out = ahrs.quaternion.wxyz
+                e_out = ahrs.quaternion.to_euler()
+            elif SENSOR_MODE == "am":
+                ahrs.update(np.zeros(3), acc, mag, dt)
+                q_out = ahrs.quaternion.wxyz
+                e_out = ahrs.quaternion.to_euler()
+            elif SENSOR_MODE == "a":
+                ahrs.update_no_magnetometer(np.zeros(3), acc, dt)
+                q_out = ahrs.quaternion.wxyz
+                e_out = ahrs.quaternion.to_euler()
+            elif SENSOR_MODE == "m":
+                ahrs.update(np.zeros(3), np.zeros(3), mag, dt)
+                q_out = ahrs.quaternion.wxyz
+                e_out = ahrs.quaternion.to_euler()
+            else:  # "gam" default
+                if USE_MAGNETOMETER:
+                    ahrs.update(gyro, acc, mag, dt)
+                else:
+                    ahrs.update_no_magnetometer(gyro, acc, dt)
+                q_out = ahrs.quaternion.wxyz
+                e_out = ahrs.quaternion.to_euler()
+
+            with orientation_lock:
+                shared_quaternion = np.array(q_out)
+                shared_euler = np.array(e_out)
+                shared_frame_count += 1
+
+        # Loop playback
+        t_start += total_duration
+        last_t = time.perf_counter()
+        q_gyro = np.array([1.0, 0.0, 0.0, 0.0])
 
 # ============================================================
 # Airplane model
@@ -243,9 +490,15 @@ def create_airplane():
 # Visualization
 # ============================================================
 plotter = BackgroundPlotter(window_size=(900, 650), title="IMU Attitude Visualization")
+plotter.render_window.SetSwapControl(0)
+# Also try OpenGL-level VSync disable (more reliable)
+try:
+    ctypes.windll.opengl32.wglSwapIntervalEXT(0)
+except Exception:
+    pass
 airplane = create_airplane()
 airplane_actor = plotter.add_mesh(
-    airplane, color="steelblue", specular=0.4, smooth_shading=True)
+    airplane, color="steelblue", specular=0.0, smooth_shading=False)
 plotter.add_axes(xlabel="X(fwd)", ylabel="Y(right)", zlabel="Z(up)")
 plotter.show_grid(xtitle="X", ytitle="Y", ztitle="Z")
 hud = plotter.add_text("Waiting for data...", position="upper_left",
@@ -258,6 +511,18 @@ last_quat = None
 last_text = ""
 _print_cnt = 0
 
+def quat_to_matrix(q):
+    """Convert quaternion [w,x,y,z] to 4x4 rotation matrix."""
+    w, x, y, z = q
+    R = np.array([
+        [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z,     2*x*z + 2*w*y],
+        [2*x*y + 2*w*z,     1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
+        [2*x*z - 2*w*y,     2*y*z + 2*w*x,     1 - 2*x*x - 2*y*y],
+    ])
+    T = np.eye(4)
+    T[:3, :3] = R
+    return T
+
 # ============================================================
 # Render callback (update model only, no serial I/O)
 # ============================================================
@@ -269,18 +534,8 @@ def render_update():
         euler = shared_euler.copy()
         fc = shared_frame_count
 
-    # Update model (only when attitude changes)
-    if last_quat is None or not np.allclose(q_wxyz, last_quat, atol=1e-7):
-        last_quat = q_wxyz
-        w, x, y, z = q_wxyz
-        R = np.array([
-            [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z,     2*x*z + 2*w*y],
-            [2*x*y + 2*w*z,     1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-            [2*x*z - 2*w*y,     2*y*z + 2*w*x,     1 - 2*x*x - 2*y*y],
-        ])
-        T = np.eye(4)
-        T[:3, :3] = R
-        airplane_actor.user_matrix = T
+    # Always update model matrix
+    airplane_actor.user_matrix = quat_to_matrix(q_wxyz)
 
     # to_euler() returns degrees
     roll_deg = euler[0]
@@ -298,13 +553,27 @@ def render_update():
         hud.set_text(0, text)
         last_text = text
 
+    # Yield GIL to serial thread
+    time.sleep(0)
+
 # ============================================================
 # Start
 # ============================================================
-if ser is not None:
+if PLAYBACK_FILE:
+    t = threading.Thread(target=playback_thread, daemon=True)
+    t.start()
+    plotter.add_callback(render_update, interval=2)
+    print(f"Playback started from {PLAYBACK_FILE}")
+elif ser is not None:
     t = threading.Thread(target=serial_thread, daemon=True)
     t.start()
-    plotter.add_callback(render_update, interval=10)
+    # Boost serial thread priority to reduce GIL starvation by Qt
+    THREAD_SET_INFORMATION = 0x0020
+    handle = ctypes.windll.kernel32.OpenThread(THREAD_SET_INFORMATION, False, t.native_id)
+    if handle:
+        ctypes.windll.kernel32.SetThreadPriority(handle, 1)  # ABOVE_NORMAL
+        ctypes.windll.kernel32.CloseHandle(handle)
+    plotter.add_callback(render_update, interval=2)
     print("IMU data acquisition started (background thread), 3D view ready")
 else:
     hud.set_text(0, f"Waiting for serial {SERIAL_PORT} ...\n(static model when no hardware)")

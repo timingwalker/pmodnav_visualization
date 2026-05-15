@@ -1,6 +1,7 @@
 """End-to-end performance measurement."""
 import time
 import ctypes
+import gc
 import threading
 import numpy as np
 import pyvista as pv
@@ -9,12 +10,13 @@ import imufusion
 import serial
 
 ctypes.windll.winmm.timeBeginPeriod(1)
+gc.disable()
 
 SERIAL_PORT = "COM4"
-BAUD_RATE = 115200
-SAMPLE_PERIOD = 1 / 85
+BAUD_RATE = 460800
+SAMPLE_PERIOD = 1 / 449
 GYRO_SCALE = 245.0 / 32768.0 * np.pi / 180.0
-ACC_SCALE = 2.0 / 32768.0
+ACC_SCALE = 4.0 / 32768.0
 MAG_SCALE = 4.0 / 32768.0
 CALIB = 100
 
@@ -69,7 +71,7 @@ while ahrs.flags.initialising:
     ahrs.update(
         np.array([gx, -gy, gz], dtype=np.float64),
         np.array([ax, -ay, az], dtype=np.float64),
-        np.array([mx, -my, mz], dtype=np.float64),
+        np.array([mx, my, mz], dtype=np.float64),
         SAMPLE_PERIOD,
     )
     init_frames += 1
@@ -94,13 +96,17 @@ running = True
 def serial_loop():
     buf = b""
     global running
+    last_t = time.perf_counter()
     while running:
         try:
-            chunk = ser.read(max(1, ser.in_waiting or 1))
+            n = ser.in_waiting
+            if n:
+                chunk = ser.read(n)
+            else:
+                time.sleep(0.001)
+                continue
         except Exception:
             break
-        if not chunk:
-            continue
         buf += chunk
         while b"\n" in buf:
             line_bytes, buf = buf.split(b"\n", 1)
@@ -123,12 +129,17 @@ def serial_loop():
             ax *= ACC_SCALE; ay *= ACC_SCALE; az *= ACC_SCALE
             mx *= MAG_SCALE; my *= MAG_SCALE; mz *= MAG_SCALE
 
+            now = time.perf_counter()
+            dt = now - last_t
+            last_t = now
+            if dt > 0.1:
+                dt = SAMPLE_PERIOD
             t1 = time.perf_counter()
             ahrs.update(
                 np.array([gx, -gy, gz], dtype=np.float64),
                 np.array([ax, -ay, az], dtype=np.float64),
-                np.array([mx, -my, mz], dtype=np.float64),
-                SAMPLE_PERIOD,
+                np.array([mx, my, mz], dtype=np.float64),
+                dt,
             )
             t2 = time.perf_counter()
 
@@ -205,13 +216,22 @@ def render_cb():
                 f"AHRS: {ahrs_avg:.1f} us")
         hud.set_text(0, text)
 
+    # Yield GIL to serial thread
+    time.sleep(0)
+
 # ── Start ──
 t = threading.Thread(target=serial_loop, daemon=True)
 t.start()
+# Boost serial thread priority to reduce GIL starvation by Qt
+THREAD_SET_INFORMATION = 0x0020
+handle = ctypes.windll.kernel32.OpenThread(THREAD_SET_INFORMATION, False, t.native_id)
+if handle:
+    ctypes.windll.kernel32.SetThreadPriority(handle, 1)  # ABOVE_NORMAL
+    ctypes.windll.kernel32.CloseHandle(handle)
 time.sleep(0.5)
 print(f"Received {stats['serial_count']} serial frames after startup")
 
-plotter.add_callback(render_cb, interval=10)
+plotter.add_callback(render_cb, interval=5)
 print("Window open, close it to see report...\n")
 plotter.app.exec()
 
@@ -237,6 +257,10 @@ if ri:
     print(f"    Avg interval: {avg:.1f} ms  ->  {1000/avg:.1f} FPS")
     print(f"    Min: {min(ri_stable):.1f} ms  Max: {max(ri_stable):.1f} ms")
     print(f"    Jitter: {max(ri_stable)-min(ri_stable):.1f} ms")
+    print(f"\n    All intervals (ms):")
+    for i, v in enumerate(ri_stable):
+        marker = " <-- spike" if v > avg * 3 else ""
+        print(f"      [{i+1:4d}] {v:6.1f}{marker}")
 else:
     print("\n[1] Render callback: no data!")
 
@@ -249,6 +273,10 @@ if si:
     print(f"    Avg interval: {avg_si:.1f} ms  ->  {1000/avg_si:.1f} Hz")
     print(f"    Min interval: {min(si_stable):.1f} ms")
     print(f"    Max interval: {max(si_stable):.1f} ms")
+    print(f"\n    All intervals (ms):")
+    for i, v in enumerate(si_stable):
+        marker = " <-- spike" if v > avg_si * 3 else ""
+        print(f"      [{i+1:4d}] {v:6.1f}{marker}")
 else:
     print(f"\n[2] Serial data: total={sc}, no interval data")
 

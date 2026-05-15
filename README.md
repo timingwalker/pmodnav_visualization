@@ -128,7 +128,7 @@ python main.py --recal
 | Parameter | Value | Notes |
 |---|---|---|
 | Convention | NWU | North-West-Up |
-| Gain | 0.1 | Lower = faster response (gyro trust > accel/mag) |
+| Gain | 0.5 | Higher = faster convergence (accel/mag trust > gyro) |
 | Gyro range | 245 dps | Matches sensor hardware |
 
 These can be adjusted in `main.py` (lines 26–31).
