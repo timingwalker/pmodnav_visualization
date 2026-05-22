@@ -13,6 +13,17 @@ MAG_SCALE = 4.0 / 32768.0
 CALIB_FILE = "calib.json"
 gyro_bias = np.zeros(3)
 mag_offset = np.zeros(3)
+
+def _parse_parts(parts):
+    """Return 9 sensor values from 9 or 11 field format. Returns None on error."""
+    try:
+        if len(parts) == 11:
+            return [int(x) for x in parts[2:]]
+        elif len(parts) == 9:
+            return [int(x) for x in parts]
+    except ValueError:
+        pass
+    return None
 if os.path.exists(CALIB_FILE):
     d = json.load(open(CALIB_FILE))
     gyro_bias = np.array(d["gyro_bias"])
@@ -32,13 +43,12 @@ n = 0
 while ahrs.flags.initialising and n < 500:
     raw = ser.readline().decode(errors="ignore").strip()
     parts = raw.split(",")
-    if len(parts) != 9: continue
-    try: v = [int(x) for x in parts]
-    except: continue
+    v = _parse_parts(parts)
+    if v is None: continue
     gx=v[0]*GYRO_SCALE-gyro_bias[0]; gy=v[1]*GYRO_SCALE-gyro_bias[1]; gz=v[2]*GYRO_SCALE-gyro_bias[2]
     ax=v[3]*ACC_SCALE; ay=v[4]*ACC_SCALE; az=v[5]*ACC_SCALE
     mx=(v[6]-mag_offset[0])*MAG_SCALE; my=(v[7]-mag_offset[1])*MAG_SCALE; mz=(v[8]-mag_offset[2])*MAG_SCALE
-    ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,my,mz],dtype=np.float64), 1/449)
+    ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,-my,mz],dtype=np.float64), 1/449)
     n += 1
 print(f"Init done: {n} frames\n")
 
@@ -52,9 +62,8 @@ def run_step(title, header, fmt_func):
         while True:
             raw = ser.readline().decode(errors="ignore").strip()
             parts = raw.split(",")
-            if len(parts) != 9: continue
-            try: v = [int(x) for x in parts]
-            except: continue
+            v = _parse_parts(parts)
+            if v is None: continue
             if cnt % 10 == 0:
                 print(f"  {fmt_func(v)}")
             cnt += 1
@@ -125,13 +134,12 @@ try:
     while True:
         raw = ser.readline().decode(errors="ignore").strip()
         parts = raw.split(",")
-        if len(parts) != 9: continue
-        try: v = [int(x) for x in parts]
-        except: continue
+        v = _parse_parts(parts)
+        if v is None: continue
         gx=v[0]*GYRO_SCALE-gyro_bias[0]; gy=v[1]*GYRO_SCALE-gyro_bias[1]; gz=v[2]*GYRO_SCALE-gyro_bias[2]
         ax=v[3]*ACC_SCALE; ay=v[4]*ACC_SCALE; az=v[5]*ACC_SCALE
         mx=(v[6]-mag_offset[0])*MAG_SCALE; my=(v[7]-mag_offset[1])*MAG_SCALE; mz=(v[8]-mag_offset[2])*MAG_SCALE
-        ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,my,mz],dtype=np.float64), 1/449)
+        ahrs.update(np.array([gx,-gy,gz],dtype=np.float64), np.array([ax,-ay,az],dtype=np.float64), np.array([mx,-my,mz],dtype=np.float64), 1/449)
         if cnt % 10 == 0:
             r, p, y = ahrs.quaternion.to_euler()
             print(f"  {r:8.1f} {p:8.1f} {y:8.1f}")

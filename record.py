@@ -24,7 +24,7 @@ with open(OUTPUT, "w") as f:
                 line_bytes, buf = buf.split(b"\n", 1)
                 line = line_bytes.decode(errors="ignore").strip()
                 parts = line.split(",")
-                if len(parts) != 9:
+                if len(parts) not in (9, 11):
                     continue
                 try:
                     [int(p) for p in parts]

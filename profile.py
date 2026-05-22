@@ -31,11 +31,17 @@ samples = 0
 while samples < CALIB:
     raw = ser.readline().decode(errors="ignore").strip()
     parts = raw.split(",")
-    if len(parts) != 9:
-        continue
-    try:
-        vals = [int(p) for p in parts]
-    except ValueError:
+    if len(parts) == 11:
+        try:
+            vals = [int(p) for p in parts[2:]]
+        except ValueError:
+            continue
+    elif len(parts) == 9:
+        try:
+            vals = [int(p) for p in parts]
+        except ValueError:
+            continue
+    else:
         continue
     gyro_bias[0] += vals[0] * GYRO_SCALE
     gyro_bias[1] += vals[1] * GYRO_SCALE
@@ -54,11 +60,17 @@ init_frames = 0
 while ahrs.flags.initialising:
     raw = ser.readline().decode(errors="ignore").strip()
     parts = raw.split(",")
-    if len(parts) != 9:
-        continue
-    try:
-        vals = [int(p) for p in parts]
-    except ValueError:
+    if len(parts) == 11:
+        try:
+            vals = [int(p) for p in parts[2:]]
+        except ValueError:
+            continue
+    elif len(parts) == 9:
+        try:
+            vals = [int(p) for p in parts]
+        except ValueError:
+            continue
+    else:
         continue
     gx, gy, gz = vals[0], vals[1], vals[2]
     ax, ay, az = vals[3], vals[4], vals[5]
@@ -71,7 +83,7 @@ while ahrs.flags.initialising:
     ahrs.update(
         np.array([gx, -gy, gz], dtype=np.float64),
         np.array([ax, -ay, az], dtype=np.float64),
-        np.array([mx, my, mz], dtype=np.float64),
+        np.array([mx, -my, mz], dtype=np.float64),
         SAMPLE_PERIOD,
     )
     init_frames += 1
@@ -96,65 +108,77 @@ running = True
 def serial_loop():
     buf = b""
     global running
-    last_t = time.perf_counter()
+    last_ts = None  # previous frame hardware timestamp (microseconds)
     while running:
         try:
             n = ser.in_waiting
             if n:
                 chunk = ser.read(n)
+                buf += chunk
+
+            if b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line = line_bytes.decode(errors="ignore").strip()
+                parts = line.split(",")
+                if len(parts) == 11:
+                    try:
+                        ts_hi = int(parts[0]) & 0xFFFFFFFF
+                        ts_lo = int(parts[1]) & 0xFFFFFFFF
+                        ts_us = ((ts_hi << 32) | ts_lo) / 25.0
+                        vals = [int(p) for p in parts[2:]]
+                    except ValueError:
+                        continue
+                elif len(parts) == 9:
+                    try:
+                        ts_us = 0
+                        vals = [int(p) for p in parts]
+                    except ValueError:
+                        continue
+                else:
+                    continue
+
+                gx, gy, gz = vals[0:3]
+                ax, ay, az = vals[3:6]
+                mx, my, mz = vals[6:9]
+
+                gx = gx * GYRO_SCALE - gyro_bias[0]
+                gy = gy * GYRO_SCALE - gyro_bias[1]
+                gz = gz * GYRO_SCALE - gyro_bias[2]
+                ax *= ACC_SCALE; ay *= ACC_SCALE; az *= ACC_SCALE
+                mx *= MAG_SCALE; my *= MAG_SCALE; mz *= MAG_SCALE
+
+                if ts_us > 0 and last_ts is not None:
+                    dt = (ts_us - last_ts) / 1_000_000.0
+                    if dt > 0.1 or dt <= 0:
+                        dt = SAMPLE_PERIOD
+                else:
+                    dt = SAMPLE_PERIOD
+                last_ts = ts_us
+                t1 = time.perf_counter()
+                ahrs.update(
+                    np.array([gx, -gy, gz], dtype=np.float64),
+                    np.array([ax, -ay, az], dtype=np.float64),
+                    np.array([mx, -my, mz], dtype=np.float64),
+                    dt,
+                )
+                t2 = time.perf_counter()
+
+                with lock:
+                    now = time.perf_counter()
+                    si = (now - stats["serial_last_ts"]) * 1000
+                    stats["serial_last_ts"] = now
+                    stats["serial_count"] += 1
+                    stats["serial_intervals"].append(si)
+                    stats["ahrs_us"].append((t2 - t1) * 1e6)
+                    q = ahrs.quaternion.wxyz
+                    stats["q_list"].append(np.array(q))
+                    if len(stats["q_list"]) > 200:
+                        stats["q_list"].pop(0)
             else:
                 time.sleep(0.001)
-                continue
+
         except Exception:
-            break
-        buf += chunk
-        while b"\n" in buf:
-            line_bytes, buf = buf.split(b"\n", 1)
-            line = line_bytes.decode(errors="ignore").strip()
-            parts = line.split(",")
-            if len(parts) != 9:
-                continue
-            try:
-                vals = [int(p) for p in parts]
-            except ValueError:
-                continue
-
-            gx, gy, gz = vals[0:3]
-            ax, ay, az = vals[3:6]
-            mx, my, mz = vals[6:9]
-
-            gx = gx * GYRO_SCALE - gyro_bias[0]
-            gy = gy * GYRO_SCALE - gyro_bias[1]
-            gz = gz * GYRO_SCALE - gyro_bias[2]
-            ax *= ACC_SCALE; ay *= ACC_SCALE; az *= ACC_SCALE
-            mx *= MAG_SCALE; my *= MAG_SCALE; mz *= MAG_SCALE
-
-            now = time.perf_counter()
-            dt = now - last_t
-            last_t = now
-            if dt > 0.1:
-                dt = SAMPLE_PERIOD
-            t1 = time.perf_counter()
-            ahrs.update(
-                np.array([gx, -gy, gz], dtype=np.float64),
-                np.array([ax, -ay, az], dtype=np.float64),
-                np.array([mx, my, mz], dtype=np.float64),
-                dt,
-            )
-            t2 = time.perf_counter()
-
-            with lock:
-                now = time.perf_counter()
-                si = (now - stats["serial_last_ts"]) * 1000
-                stats["serial_last_ts"] = now
-                stats["serial_count"] += 1
-                stats["serial_intervals"].append(si)
-                stats["ahrs_us"].append((t2 - t1) * 1e6)
-                # Keep last 200 quaternions (sliding window)
-                q = ahrs.quaternion.wxyz
-                stats["q_list"].append(np.array(q))
-                if len(stats["q_list"]) > 200:
-                    stats["q_list"].pop(0)
+            time.sleep(0.001)
 
     print("Serial thread exited")
 
@@ -215,9 +239,6 @@ def render_cb():
                 f"Serial frames: {sc}\n"
                 f"AHRS: {ahrs_avg:.1f} us")
         hud.set_text(0, text)
-
-    # Yield GIL to serial thread
-    time.sleep(0)
 
 # ── Start ──
 t = threading.Thread(target=serial_loop, daemon=True)

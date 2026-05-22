@@ -100,16 +100,28 @@ mag_offset = np.zeros(3)
 gz_deadband = 0.0  # rad/s, below this threshold gz is forced to 0
 
 def parse_line(line):
+    """Parse one line of sensor data. Returns (ts_us, [gx,gy,gz,ax,ay,az,mx,my,mz]) or None.
+    ts_us is microseconds from the 25MHz hardware counter, or 0 if legacy format.
+    """
     line = line.strip()
     if not line:
         return None
     parts = line.split(",")
-    if len(parts) != 9:
-        return None
-    try:
-        return [int(p) for p in parts]
-    except ValueError:
-        return None
+    if len(parts) == 11:
+        try:
+            ts_hi = int(parts[0]) & 0xFFFFFFFF
+            ts_lo = int(parts[1]) & 0xFFFFFFFF
+            ts = ((ts_hi << 32) | ts_lo) / 25.0  # 25MHz → microseconds
+            vals = [int(p) for p in parts[2:]]
+            return ts, vals
+        except ValueError:
+            return None
+    elif len(parts) == 9:
+        try:
+            return 0, [int(p) for p in parts]
+        except ValueError:
+            return None
+    return None
 
 if ser is not None:
     if os.path.exists(CALIB_FILE) and "--recal" not in sys.argv:
@@ -130,14 +142,15 @@ if ser is not None:
         gz_samples = []
         while samples < CALIBRATION_FRAMES:
             raw = ser.readline().decode(errors="ignore")
-            vals = parse_line(raw)
-            if vals is None:
+            result = parse_line(raw)
+            if result is None:
                 continue
+            _, vals = result
             gx, gy, gz = vals[0], vals[1], vals[2]
             gyro_bias[0] += gx * GYRO_SCALE
             gyro_bias[1] += gy * GYRO_SCALE
             gyro_bias[2] += gz * GYRO_SCALE
-            gz_samples.append(gz * GYRO_SCALE)  # in rad/s
+            gz_samples.append(gz * GYRO_SCALE)
             samples += 1
         gyro_bias /= CALIBRATION_FRAMES
         gz_std = float(np.std(gz_samples))
@@ -157,9 +170,10 @@ if ser is not None:
             try:
                 while time.perf_counter() - t0 < duration:
                     raw = ser.readline().decode(errors="ignore")
-                    vals = parse_line(raw)
-                    if vals is None:
+                    result = parse_line(raw)
+                    if result is None:
                         continue
+                    _, vals = result
                     mx, my, mz = vals[6], vals[7], vals[8]
                     mag_min[0] = min(mag_min[0], mx)
                     mag_min[1] = min(mag_min[1], my)
@@ -209,9 +223,10 @@ if ser is not None and SENSOR_MODE != "g":
     max_init = 500 if USE_MAGNETOMETER else 200
     while ahrs.flags.initialising and init_frames < max_init:
         raw = ser.readline().decode(errors="ignore")
-        vals = parse_line(raw)
-        if vals is None:
+        result = parse_line(raw)
+        if result is None:
             continue
+        _, vals = result
         gx, gy, gz = vals[0], vals[1], vals[2]
         ax, ay, az = vals[3], vals[4], vals[5]
         mx, my, mz = vals[6], vals[7], vals[8]
@@ -226,7 +241,7 @@ if ser is not None and SENSOR_MODE != "g":
             ahrs.update(
                 np.array([gx, -gy, gz], dtype=np.float64),
                 np.array([ax, -ay, az], dtype=np.float64),
-                np.array([mx, my, mz], dtype=np.float64),
+                np.array([mx, -my, mz], dtype=np.float64),
                 SAMPLE_PERIOD,
             )
         else:
@@ -285,7 +300,7 @@ def _quat_to_euler(q):
 def serial_thread():
     global shared_quaternion, shared_euler, shared_frame_count, shared_feed_interval
     buf = b""
-    last_t = time.perf_counter()
+    last_ts = None  # previous frame hardware timestamp (microseconds)
     feed_times = []
     q_gyro = np.array([1.0, 0.0, 0.0, 0.0])  # for gyro-only mode
     # 60Hz sync accumulators
@@ -301,18 +316,15 @@ def serial_thread():
             n = ser.in_waiting
             if n:
                 chunk = ser.read(n)
-            else:
-                time.sleep(0.001)
-                continue
-            buf += chunk
+                buf += chunk
 
-            # Extract complete lines from buffer (delimited by \n)
-            while b"\n" in buf:
+            if b"\n" in buf:
                 line_bytes, buf = buf.split(b"\n", 1)
                 line = line_bytes.decode(errors="ignore")
-                vals = parse_line(line)
-                if vals is None:
+                result = parse_line(line)
+                if result is None:
                     continue
+                ts_us, vals = result
 
                 gx, gy, gz, ax, ay, az, mx, my, mz = vals
                 gx = gx * GYRO_SCALE - gyro_bias[0]
@@ -330,13 +342,15 @@ def serial_thread():
 
                 gyro = np.array([gx, -gy, gz], dtype=np.float64)
                 acc  = np.array([ax, -ay, az], dtype=np.float64)
-                mag  = np.array([mx, my, mz], dtype=np.float64)
+                mag  = np.array([mx, -my, mz], dtype=np.float64)
 
-                now = time.perf_counter()
-                dt = now - last_t
-                last_t = now
-                if dt > 0.1:
+                if ts_us > 0 and last_ts is not None:
+                    dt = (ts_us - last_ts) / 1_000_000.0  # µs → s
+                    if dt > 0.1 or dt <= 0:
+                        dt = SAMPLE_PERIOD
+                else:
                     dt = SAMPLE_PERIOD
+                last_ts = ts_us
 
                 # --- 60Hz sync: accumulate gyro, batch-update AHRS ---
                 if SYNC_60HZ and SENSOR_MODE == "gam":
@@ -413,6 +427,8 @@ def serial_thread():
                     shared_quaternion = np.array(q_out)
                     shared_euler = np.array(e_out)
                     shared_frame_count += 1
+            else:
+                pass
 
         except Exception:
             time.sleep(0.001)
@@ -455,10 +471,11 @@ def playback_thread():
             wait = t_target - time.perf_counter()
             if wait > 0:
                 time.sleep(wait)
-            vals = parse_line(lines_data[idx][1])
+            result = parse_line(lines_data[idx][1])
             idx += 1
-            if vals is None:
+            if result is None:
                 continue
+            _, vals = result
 
             gx, gy, gz, ax, ay, az, mx, my, mz = vals
             gx = gx * GYRO_SCALE - gyro_bias[0]
@@ -473,7 +490,7 @@ def playback_thread():
 
             gyro = np.array([gx, -gy, gz], dtype=np.float64)
             acc = np.array([ax, -ay, az], dtype=np.float64)
-            mag = np.array([mx, my, mz], dtype=np.float64)
+            mag = np.array([mx, -my, mz], dtype=np.float64)
 
             now = time.perf_counter()
             dt = now - last_t
