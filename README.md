@@ -1,256 +1,166 @@
 # PmodNAV IMU 3D Attitude Visualization
 
-[English](#english) | [中文](#chinese)
+Real-time 3D airplane visualization for raw LSM9DS1/PmodNAV serial data.
 
-> This project was developed with the assistance of **DeepSeek V4-Pro** (via Claude Code), totaling ~1.53 billion tokens. See [doc/REPORT.md](doc/REPORT.md) for the full development journey.
+The current stable path is intentionally simple: **gyro-only orientation display** with a manually supplied effective sample rate. This gives responsive motion and correct 360 degree rotations. Accelerometer and magnetometer fusion remain available for diagnosis, but they are not the default because they caused slow response, pitch fold-back, and yaw/heading pull during large rotations in the current hardware/firmware setup.
 
-<a id="english"></a>
-Real-time 3D visualization of the LSM9DS1 on a [PmodNAV](https://digilent.com/reference/pmod/pmodnav) module using sensor fusion and pyvista.
+## Files
 
-Reads 9-axis IMU data (gyro + accelerometer + magnetometer) from the PmodNAV via serial port, fuses them with [imuFusion](https://github.com/xioTechnologies/Fusion), and displays a real-time airplane model in 3D.
+| File | Purpose |
+|---|---|
+| `main.py` | Main 3D visualization app |
+| `diagnose.py` | Serial, gyro integral, magnetometer heading, and AHRS diagnostic tools |
+| `profile.py` | Optional performance profiling window |
+| `record.py` | Raw serial recorder for playback/debugging |
+| `calib.json` | Generated calibration data |
+| `doc/REPORT.md` | Current debugging notes and operating decisions |
 
-## Directory Structure
+## Hardware And Serial Data
 
-```
-├── main.py              Main program
-├── diagnose.py          Step-by-step diagnostic tool for debugging
-├── profile.py           Performance measurement (frame rate, latency, AHRS timing)
-├── calib.json           Calibration data (auto-generated)
-├── requirements.txt     Python dependencies
-├── doc/REPORT.md            Full development report (Chinese)
-```
+The firmware sends CSV frames over USB serial:
 
-## Hardware Setup
-
-- **Sensor**: LSM9DS1 on a [PmodNAV](https://digilent.com/reference/pmod/pmodnav) module (SPI), connected to a microcontroller (STM32 or similar)
-- **Connection**: USB serial (COM port)
-- **Baud rate**: 115200
-- **Output rate**: ~85 Hz (configurable in firmware)
-
-## Serial Data Format
-
-The firmware reads LSM9DS1 registers and outputs one line per sample:
-
-```
-gx,gy,gz,ax,ay,az,mx,my,mz\r\n
+```text
+gx,gy,gz,ax,ay,az,mx,my,mz
 ```
 
-| Field | Description | Range |
-|---|---|---|
-| `gx, gy, gz` | Gyroscope raw ADC (int16) | ±245 dps |
-| `ax, ay, az` | Accelerometer raw ADC (int16) | ±2 g |
-| `mx, my, mz` | Magnetometer raw ADC (int16) | ±4 Gauss |
+The parser also accepts an 11-field format with two timestamp fields before the 9 sensor values:
 
-### Sensor Register Configuration
-
-| Register | Value | Meaning |
-|---|---|---|
-| `CTRL_REG1_G` (0x10) | 0x60 | Gyro ±245 dps, 119 Hz |
-| `CTRL_REG6_XL` (0x1F) | 0x38 | Accel ±2g, 119 Hz |
-| `CTRL_REG1_M` (0x20) | 0x7E | Mag 80 Hz |
-| `CTRL_REG2_M` (0x21) | 0x00 | Mag ±4 Gauss |
-
-### Scale Factors
-
-```python
-GYRO_SCALE = 245.0 / 32768.0 * pi / 180.0   # dps → rad/s
-ACC_SCALE  = 2.0 / 32768.0                    # g
-MAG_SCALE  = 4.0 / 32768.0                    # Gauss
+```text
+ts_hi,ts_lo,gx,gy,gz,ax,ay,az,mx,my,mz
 ```
+
+Current defaults:
+
+| Setting | Value |
+|---|---|
+| Baud rate | `460800` |
+| Gyro scale | `245 / 32768` dps/count |
+| Accelerometer scale | `4 / 32768` g/count |
+| Magnetometer scale | `4 / 32768` gauss/count |
+| Effective sample rate for current old firmware | `381 Hz` |
+
+The serial line rate can be higher than the effective IMU update rate. For the currently connected firmware, 381 Hz was validated by integrating a physical 360 degree Y-axis rotation to about 355 degrees.
 
 ## Coordinate System
 
-The sensor is placed on a desk with the user facing the monitor:
+The physical sensor orientation is:
 
-```
-Sensor X → Forward (toward monitor) = North
-Sensor Y → Right hand side           = East
-Sensor Z → Upward                    = Up
+```text
+X: forward
+Y: right
+Z: up
 ```
 
-We use the **NWU** (North-West-Up) convention from imuFusion. Since the sensor's Y is East (not West), only Y is negated:
+For imuFusion's `NWU` convention, Y is negated when using `ga` or `gam` modes:
 
 ```python
-gyro: [ gx, -gy,  gz]     # Y negated (East → West)
-acc:  [ ax, -ay,  az]     # Y negated
-mag:  [ mx,  my,  mz]     # NOT negated (heading via atan2)
+gyro = [gx, -gy, gz]
+acc  = [ax, -ay, az]
+mag  = [mx, -my, mz]
 ```
 
-## Quick Start
+The main app displays orientation relative to the first received frame, so place the sensor in the desired neutral airplane pose before starting or before the first data frame arrives.
 
-### 1. Set COM port
-
-Open [main.py](main.py) and change `SERIAL_PORT` to match your device's COM port (e.g., `COM3`, `COM5`, etc. on Windows; `/dev/ttyUSB0` on Linux):
-
-```python
-SERIAL_PORT = "COM4"   # ← change this to your actual port
-```
-
-> On Windows, find the COM number in **Device Manager → Ports (COM & LPT)**. On Linux, check `ls /dev/tty*`.
-
-### 2. Install dependencies
+## Install
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
-### 3. Calibrate (first run only)
+## Run
 
-Connect the sensor and keep it still, then run:
+Recommended command for the current board/firmware:
 
 ```bash
-python main.py --recal
+.venv/bin/python main.py --port /dev/cu.usbserial-210319AB5A421 --sample-hz 381
 ```
 
-Follow the prompts:
-- Keep the sensor **still** for gyro bias calibration (~1.2s)
-- Slowly rotate the sensor **in all directions** for magnetometer calibration (20s)
-- Keep the sensor **still** until AHRS initialization completes
+On Windows, replace the port with something like `COM4`.
 
-Calibration data is saved to `calib.json` and reused on subsequent runs.
+The default sensor mode is:
 
-### 4. Run
+```text
+--sensors g
+```
+
+This is gyro-only orientation display. It is the current stable mode because it is responsive and supports full 360 degree rotations.
+
+## Useful Options
+
+| Option | Meaning |
+|---|---|
+| `--port PORT` | Serial port path/name |
+| `--baud N` | Serial baud rate, default `460800` |
+| `--sample-hz N` | Override effective sample rate; use `381` for the current old firmware |
+| `--recal` | Recreate `calib.json` |
+| `--sensors g` | Gyro-only display, default and recommended |
+| `--sensors ga` | Gyro + accelerometer fusion, useful for drift experiments but not full flips |
+| `--sensors gam --mag` | Gyro + accelerometer + magnetometer fusion, diagnostic only for now |
+
+Advanced options kept for diagnostics:
+
+| Option | Meaning |
+|---|---|
+| `--playback FILE` | Replay a recorded raw-data file instead of opening serial |
+| `--gain N` | Override AHRS fusion gain for `ga`/`gam` experiments |
+| `--acc-rej N` | Override accelerometer rejection threshold |
+| `--mag-rej N` | Override magnetometer rejection threshold |
+| `--mag` / `--no-mag` | Enable or disable magnetometer fusion when using `gam`; default is off |
+
+## Calibration
+
+Run calibration when changing boards or after a bad `calib.json`:
 
 ```bash
-python main.py
+.venv/bin/python main.py --port /dev/cu.usbserial-210319AB5A421 --sample-hz 381 --recal
 ```
 
-The 3D window opens once AHRS initialization is complete. Move the sensor and watch the airplane follow.
+`calib.json` currently stores:
 
-To force recalibration at any time:
+| Field | Meaning |
+|---|---|
+| `gyro_bias` | Gyroscope zero-rate bias |
+| `mag_offset` | Magnetometer hard-iron offset |
+| `gz_deadband` | Small Z gyro deadband derived from calibration noise |
 
-```bash
-python main.py --recal
-```
-
-## AHRS Parameters
-
-| Parameter | Value | Notes |
-|---|---|---|
-| Convention | NWU | North-West-Up |
-| Gain | 0.5 | Higher = faster convergence (accel/mag trust > gyro) |
-| Gyro range | 245 dps | Matches sensor hardware |
-
-These can be adjusted in `main.py` (lines 26–31).
+For default gyro-only display, the gyro bias is the most important part.
 
 ## Diagnostics
 
-If something seems wrong, use the step-by-step diagnostic tool:
+Raw serial watch:
 
 ```bash
-python diagnose.py
+.venv/bin/python diagnose.py --raw-watch --port /dev/cu.usbserial-210319AB5A421
 ```
 
-It walks through 4 steps:
-1. **Raw ADC** — verify serial data is arriving
-2. **SI Conversion** — verify scale factors and bias calibration
-3. **Coordinate Mapping** — verify NWU axis mapping
-4. **AHRS Attitude** — verify orientation angles
-
-Each step prints live data. Press `Ctrl+C` to advance to the next step.
-
-## Performance Profiling
+Validate gyro integration for a physical 360 degree Y-axis rotation:
 
 ```bash
-python profile.py
+.venv/bin/python diagnose.py --gyro-integral --port /dev/cu.usbserial-210319AB5A421 --axis y --sample-hz 381 --print-hz 2
 ```
 
-Measures render frame rate, serial data rate, AHRS computation time, and quaternion change rate. Displays real-time FPS in the 3D window and prints a summary report when closed.
+Show all three integrated gyro axes for a single motion:
+
+```bash
+.venv/bin/python diagnose.py --gyro-integral --port /dev/cu.usbserial-210319AB5A421 --axis all --sample-hz 381 --print-hz 2
+```
+
+AHRS watch:
+
+```bash
+.venv/bin/python diagnose.py --ahrs-watch --port /dev/cu.usbserial-210319AB5A421 --sensors ga --sample-hz 381 --print-hz 2
+```
+
+## Current Findings
+
+- Pure gyro mode with `--sample-hz 381` matches the desired behavior best.
+- `ga` and `gam` fusion can make pitch rotations fold back instead of completing 360 degrees.
+- Magnetometer fusion currently pulls yaw during pitch motion, causing the airplane to move along a wrong diagonal path.
+- The magnetometer should remain off in normal use until its calibration and coordinate behavior are revalidated.
 
 ## Notes
 
-- If you change environments (different desk/location), run `python main.py --recal` to recalibrate the magnetometer.
-- `imuFusion.quaternion.to_euler()` returns **degrees** directly (not radians). Do not apply `np.degrees()`.
-- pyvista 0.48 requires PyQt6 and pyvistaqt; older API calls like `add_timer_callback` or `SetOrientation` no longer work.
-
----
-
-<a id="chinese"></a>
-## 中文概述
-
-> 本项目由 **DeepSeek V4-Pro**（通过 Claude Code）辅助开发，总计消耗约 1.53 亿 token。完整开发过程见 [doc/REPORT.md](doc/REPORT.md)。
-
-基于 [PmodNAV](https://digilent.com/reference/pmod/pmodnav) 模块上的 LSM9DS1 九轴传感器，通过串口读取数据，使用 [imuFusion](https://github.com/xioTechnologies/Fusion) 进行姿态融合，pyvista 实时 3D 渲染飞机模型。
-
-### 目录结构
-
-```
-├── main.py              主程序
-├── diagnose.py           分步诊断工具（原始数据 → 姿态角）
-├── profile.py            全链路性能测量
-├── calib.json            校准数据（自动生成，可复用）
-├── requirements.txt      Python 依赖
-├── doc/REPORT.md             完整开发报告（中文）
-```
-
-### 串口数据格式
-
-固件以 115200 波特率、约 85 Hz 频率输出，每行 9 个逗号分隔的 int16：
-
-```
-gx,gy,gz,ax,ay,az,mx,my,mz\r\n
-```
-
-| 字段 | 含义 | 量程 |
-|---|---|---|
-| `gx, gy, gz` | 陀螺仪原始 ADC | ±245 dps |
-| `ax, ay, az` | 加速度计原始 ADC | ±2 g |
-| `mx, my, mz` | 磁力计原始 ADC | ±4 Gauss |
-
-### 坐标系
-
-传感器平放桌面、正对显示器：
-
-```
-X → 前（北）    Y → 右（东）    Z → 上
-```
-
-采用 imuFusion 的 **NWU**（北-西-上）约定，传感器 Y 为东而非西，需取反：
-
-```python
-gyro: [ gx, -gy,  gz]    # Y 取反（东 → 西）
-acc:  [ ax, -ay,  az]    # Y 取反
-mag:  [ mx,  my,  mz]    # 不取反（atan2 航向计算）
-```
-
-### 快速开始
-
-**1. 修改串口号**：打开 [main.py](main.py)，将 `SERIAL_PORT` 改为实际使用的 COM 编号（Windows 在设备管理器的"端口"中查看；Linux 查看 `/dev/tty*`）：
-
-```python
-SERIAL_PORT = "COM4"   # ← 改为实际端口号
-```
-
-**2. 安装依赖**：
-
-```bash
-pip install -r requirements.txt
-```
-
-**3. 首次校准**：
-
-```bash
-python main.py --recal
-```
-
-**4. 正常运行**：
-
-```bash
-python main.py
-```
-
-校准过程：① 静止 100 帧测陀螺零偏 → ② 各方向慢旋 20 秒测磁力计硬铁 → ③ 静止等 AHRS 初始化 → 窗口打开，可以移动传感器。
-
-### 诊断与性能分析
-
-```bash
-python diagnose.py    # 逐步排查：原始ADC → SI转换 → 坐标映射 → 姿态角
-python profile.py     # 全链路性能：渲染帧率、串口速率、AHRS 耗时
-```
-
-### 注意事项
-
-- 更换使用环境后建议 `python main.py --recal` 重新校准磁力计
-- `imuFusion.quaternion.to_euler()` 返回值**已经是度数**，不要再调 `np.degrees()`
-- pyvista 0.48 依赖 PyQt6 + pyvistaqt，旧版 API（`add_timer_callback`、`SetOrientation` 等）已变更
-- 互补滤波 gain 越小陀螺权重越大、响应越快
+- Pure gyro display will slowly drift over time because any residual gyro bias is integrated. Recalibrate or restart in the neutral pose when needed.
+- Accelerometer fusion can correct long-term roll/pitch drift, but it is not suitable for arbitrary full 360 degree rotations without careful handling.
+- Magnetometer fusion is useful for heading correction only after calibration and axis mapping are proven stable.

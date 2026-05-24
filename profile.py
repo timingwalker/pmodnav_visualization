@@ -1,4 +1,5 @@
 """End-to-end performance measurement."""
+import sys
 import time
 import ctypes
 import gc
@@ -9,7 +10,8 @@ from pyvistaqt import BackgroundPlotter
 import imufusion
 import serial
 
-ctypes.windll.winmm.timeBeginPeriod(1)
+if sys.platform == "win32":
+    ctypes.windll.winmm.timeBeginPeriod(1)
 gc.disable()
 
 SERIAL_PORT = "COM4"
@@ -19,6 +21,33 @@ GYRO_SCALE = 245.0 / 32768.0 * np.pi / 180.0
 ACC_SCALE = 4.0 / 32768.0
 MAG_SCALE = 4.0 / 32768.0
 CALIB = 100
+
+def _arg_str(flag, default):
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return default
+
+def _arg_int(flag, default):
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return int(sys.argv[idx + 1])
+    return default
+
+def _arg_float(flag, default):
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return float(sys.argv[idx + 1])
+    return default
+
+SERIAL_PORT = _arg_str("--port", SERIAL_PORT)
+BAUD_RATE = _arg_int("--baud", BAUD_RATE)
+sample_hz = _arg_float("--sample-hz", 0.0)
+if sample_hz > 0:
+    SAMPLE_PERIOD = 1.0 / sample_hz
 
 # ── Serial ──
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
@@ -183,18 +212,50 @@ def serial_loop():
     print("Serial thread exited")
 
 # ── Visualization ──
+def triangle_plate_xy(points, thickness=0.08):
+    z = thickness / 2.0
+    vertices = np.array(
+        [[points[0][0], points[0][1], -z],
+         [points[1][0], points[1][1], -z],
+         [points[2][0], points[2][1], -z],
+         [points[0][0], points[0][1], z],
+         [points[1][0], points[1][1], z],
+         [points[2][0], points[2][1], z]],
+        dtype=float,
+    )
+    faces = np.array([
+        3, 0, 1, 2,
+        3, 3, 5, 4,
+        4, 0, 3, 4, 1,
+        4, 1, 4, 5, 2,
+        4, 2, 5, 3, 0,
+    ])
+    return pv.PolyData(vertices, faces)
+
+
+def hex_to_rgb(color):
+    color = color.lstrip("#")
+    return np.array([int(color[i:i + 2], 16) for i in (0, 2, 4)], dtype=np.uint8)
+
+
 plotter = BackgroundPlotter(window_size=(900, 650), title="Profile")
-airplane = (
-    pv.Cylinder(center=(0, 0, 0), direction=(1, 0, 0), radius=0.15, height=3.0) +
-    pv.Cone(center=(1.8, 0, 0), direction=(1, 0, 0), radius=0.15, height=0.8) +
-    pv.Cube(center=(-0.3, -1.2, 0), x_length=1.0, y_length=0.1, z_length=2.4) +
-    pv.Cube(center=(-0.3, 1.2, 0), x_length=1.0, y_length=0.1, z_length=2.4) +
-    pv.Cube(center=(-1.2, 0, 0.5), x_length=0.6, y_length=0.08, z_length=1.0) +
-    pv.Cube(center=(-1.2, 0, 0), x_length=0.6, y_length=1.6, z_length=0.08)
-)
-actor = plotter.add_mesh(airplane, color="steelblue", specular=0.4, smooth_shading=True)
+airplane_parts = [
+    (pv.Cylinder(center=(0, 0, 0), direction=(1, 0, 0), radius=0.15, height=2.6, resolution=24), "#f8fafc"),
+    (pv.Cone(center=(1.65, 0, 0), direction=(1, 0, 0), radius=0.17, height=0.55, resolution=24), "#ff8a1f"),
+    (triangle_plate_xy([(-0.05, -0.16), (-1.25, -1.45), (-0.50, -0.16)]), "#ff4d4f"),
+    (triangle_plate_xy([(-0.05, 0.16), (-1.25, 1.45), (-0.50, 0.16)]), "#2ecc71"),
+    (pv.Cube(center=(-1.30, 0, 0.45), x_length=0.36, y_length=0.08, z_length=0.85), "#718096"),
+    (triangle_plate_xy([(-1.18, -0.16), (-1.70, -0.70), (-1.40, -0.16)], thickness=0.07), "#718096"),
+    (triangle_plate_xy([(-1.18, 0.16), (-1.70, 0.70), (-1.40, 0.16)], thickness=0.07), "#718096"),
+]
+airplane = None
+for mesh, color in airplane_parts:
+    part = mesh.copy()
+    part.cell_data["colors"] = np.tile(hex_to_rgb(color), (part.n_cells, 1))
+    airplane = part if airplane is None else airplane + part
+actor = plotter.add_mesh(
+    airplane, scalars="colors", rgb=True, specular=0.4, smooth_shading=True)
 plotter.add_axes(xlabel="X", ylabel="Y", zlabel="Z")
-plotter.show_grid(xtitle="X", ytitle="Y", ztitle="Z")
 hud = plotter.add_text("Starting...", position="upper_left", font_size=13, color="white")
 plotter.camera.position = (8, -6, 4)
 plotter.camera.focal_point = (0, 0, 0)
@@ -244,11 +305,12 @@ def render_cb():
 t = threading.Thread(target=serial_loop, daemon=True)
 t.start()
 # Boost serial thread priority to reduce GIL starvation by Qt
-THREAD_SET_INFORMATION = 0x0020
-handle = ctypes.windll.kernel32.OpenThread(THREAD_SET_INFORMATION, False, t.native_id)
-if handle:
-    ctypes.windll.kernel32.SetThreadPriority(handle, 1)  # ABOVE_NORMAL
-    ctypes.windll.kernel32.CloseHandle(handle)
+if sys.platform == "win32":
+    THREAD_SET_INFORMATION = 0x0020
+    handle = ctypes.windll.kernel32.OpenThread(THREAD_SET_INFORMATION, False, t.native_id)
+    if handle:
+        ctypes.windll.kernel32.SetThreadPriority(handle, 1)  # ABOVE_NORMAL
+        ctypes.windll.kernel32.CloseHandle(handle)
 time.sleep(0.5)
 print(f"Received {stats['serial_count']} serial frames after startup")
 
